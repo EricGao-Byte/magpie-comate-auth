@@ -15,6 +15,10 @@ const VERSION = "1.8.0"
 const str = value => typeof value === "string" ? value : ""
 const frame = value => `data: ${JSON.stringify(value)}\n\n`
 const MAX_SESSIONS = 64
+// Comate sends TOKEN_USAGE right after the terminal ANSWER. Read a short way
+// further for it; a vendor that sends none, or keeps the stream open, must
+// not hold the reply.
+const USAGE_DRAIN_MS = 2000
 // Per client request: initial execute, one native contract correction, and
 // at most one completed-but-incomplete-text formatting turn. No POST replay.
 const MAX_FORMAT_REGENERATIONS = 1
@@ -227,7 +231,7 @@ export function cloudHooks(hooks, options = {}, shared) {
           return corrected.body
         }
         const nativeCalls = []
-        const adapted = new Response(cloudBody(response.body, request.toolSpec, nativeCalls, controller, signal, options.streamIdle, usage, correctContract, chat), { headers: { "content-type": "text/event-stream" } })
+        const adapted = new Response(cloudBody(response.body, request.toolSpec, nativeCalls, controller, signal, options.streamIdle, usage, correctContract, chat, options.usageDrainMs), { headers: { "content-type": "text/event-stream" } })
         let committed = false
         let abortListener
         const cleanup = () => {
@@ -238,6 +242,7 @@ export function cloudHooks(hooks, options = {}, shared) {
         const taskControl = {
           controller, cancelled: false, cleanup,
           usage: () => usage.value(),
+          source: () => usage.source(),
           finish() { controller.abort() },
           async cancel() { this.cancelled = true; cleanup(); controller.abort(); await adapted.body.cancel().catch(() => {}) },
           succeed(calls) {
@@ -280,17 +285,20 @@ export function cloudHooks(hooks, options = {}, shared) {
   return hooks
 }
 
-async function* timedBytes(body, controller, signal, { firstMs = 300_000, idleMs = 180_000 } = {}) {
+async function* timedBytes(body, controller, signal, { firstMs = 300_000, idleMs = 180_000 } = {}, tail) {
+  // A usage drain that gives up aborts this body alone: closing the event
+  // stream then must not wait on a read the vendor never answers.
+  const stop = tail ? AbortSignal.any([signal, tail]) : signal
   const reader = body.getReader()
   let received = false
   try {
     for (;;) {
-      signal.throwIfAborted()
+      stop.throwIfAborted()
       const budget = received ? idleMs : firstMs
       let timer, onAbort
       const stalled = new Promise((_, reject) => {
-        onAbort = () => reject(signal.reason ?? new DOMException("Aborted", "AbortError"))
-        signal.addEventListener("abort", onAbort, { once: true })
+        onAbort = () => reject(stop.reason ?? new DOMException("Aborted", "AbortError"))
+        stop.addEventListener("abort", onAbort, { once: true })
         if (budget > 0) timer = setTimeout(() => {
           const error = new Error(`Comate stream was idle for ${budget}ms; retry the turn`)
           reject(error)
@@ -299,7 +307,7 @@ async function* timedBytes(body, controller, signal, { firstMs = 300_000, idleMs
       })
       let result
       try { result = await Promise.race([reader.read(), stalled]) }
-      finally { clearTimeout(timer); signal.removeEventListener("abort", onAbort) }
+      finally { clearTimeout(timer); stop.removeEventListener("abort", onAbort) }
       if (result.done) return
       received = true
       yield result.value
@@ -310,7 +318,26 @@ async function* timedBytes(body, controller, signal, { firstMs = 300_000, idleMs
   }
 }
 
-function cloudBody(body, spec, nativeCalls, controller, signal, idle, usage, correctContract, chat) {
+// Comate reports token counts in a TOKEN_USAGE event after its terminal
+// ANSWER. Read that tail so the meter gets the real numbers, but never hold
+// the reply for a vendor that sends none or keeps the connection open.
+async function drainUsage(stream, usage, ms = USAGE_DRAIN_MS, cancel) {
+  let timer
+  const timeout = new Promise(resolve => { timer = setTimeout(resolve, ms, null) })
+  try {
+    for (;;) {
+      const result = await Promise.race([stream.next(), timeout])
+      if (result === null) { cancel?.(); return }
+      if (result.done) return
+      const content = result.value?.content
+      if (content?.type === "TOKEN_USAGE") { usage.upstream(content.detail?.usage); return }
+    }
+  } finally {
+    clearTimeout(timer)
+  }
+}
+
+function cloudBody(body, spec, nativeCalls, controller, signal, idle, usage, correctContract, chat, usageDrainMs = USAGE_DRAIN_MS) {
   const encoder = new TextEncoder()
   async function* convert() {
     const requested = value => Number.isSafeInteger(value) && value > 0 ? value : null
@@ -325,12 +352,15 @@ function cloudBody(body, spec, nativeCalls, controller, signal, idle, usage, cor
         const live = new Map(), completed = [], rejected = [], batch = []
         const nativeStart = nativeCalls.length
         let hasText = false, results, correctionText = "", formatFeedback = ""
-        for await (const event of events(timedBytes(body, controller, signal, idle))) {
+        const tail = new AbortController()
+        const stream = events(timedBytes(body, controller, signal, idle, tail.signal))
+        for await (const event of stream) {
           turn.events++
           const content = event?.content
           if (!content || typeof content.type !== "string") throw new Error("Unexpected Comate cloud event envelope")
           const detail = content.detail ?? {}
           if (["EXCEPTION", "QUOTA_EXCEED", "TOOL"].includes(content.type)) throw new Error(`Comate cloud stopped: ${content.type}`)
+          if (content.type === "TOKEN_USAGE") { usage.upstream(detail.usage); continue }
           if (content.type.startsWith("FUNCTION_CALL_")) {
             for (const tool of detail.toolUse ?? []) {
               if (!str(tool.id)) throw new Error("Cloud tool call has no id")
@@ -377,6 +407,9 @@ function cloudBody(body, spec, nativeCalls, controller, signal, idle, usage, cor
             if (detail.end === true) {
               turn.terminal_answer = true
               if (live.size) throw new Error("Comate ended with incomplete tool arguments")
+              // TOKEN_USAGE follows the terminal ANSWER, so read the tail
+              // before completing this round.
+              await drainUsage(stream, usage, usageDrainMs, () => tail.abort())
               if (rejected.length) {
                 turn.outcome = "native_contract_rejected"
                 if (correction || !spec.parallel && batch.length > 1) throw rejected[0].error

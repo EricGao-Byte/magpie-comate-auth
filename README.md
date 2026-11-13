@@ -1,6 +1,6 @@
 # Magpie Comate Auth — independent plugin
 
-本地主线开发版本 `0.5.12`。通过 HTTPS 直接请求 Comate 云端，复用这台电脑的 Comate 登录态。
+本地主线开发版本 `0.5.13`。通过 HTTPS 直接请求 Comate 云端，复用这台电脑的 Comate 登录态。
 不调用 Comate 本地服务的会话、工具执行或取消接口；云端不可用时直接报错。
 本插件独立维护，通过 Magpie 的非官方插件发现机制分发，未获官方市场审核批准。
 仓库是公开的非 fork 项目，并带有 `magpie-plugin` GitHub topic。无需 npm 发布。
@@ -26,7 +26,7 @@ magpie plugin login comate 1
 ### 方式二：下载构建产物，用本地文件夹安装
 
 从 [最新 Release](https://github.com/PengJunchen/magpie-comate-auth/releases/latest) 下载
-`magpie-comate-auth-0.5.12.zip`（附件里的安装包，不是 GitHub 自动生成的 Source code.zip），
+`magpie-comate-auth-0.5.13.zip`（附件里的安装包，不是 GitHub 自动生成的 Source code.zip），
 解压到准备长期保留的目录，例如 `~/MagpiePlugins/`：
 
 ```text
@@ -73,8 +73,8 @@ dist/
 │   ├── package.json
 │   ├── index.mjs
 │   └── …
-├── magpie-comate-auth-0.5.12.zip          ← 可直接解压的运行文件
-├── pengjunchen-magpie-comate-auth-0.5.12.tgz
+├── magpie-comate-auth-0.5.13.zip          ← 可直接解压的运行文件
+├── pengjunchen-magpie-comate-auth-0.5.13.tgz
 ├── BUILD-INFO.json
 └── SHA256SUMS
 ```
@@ -206,23 +206,31 @@ shell 路径需要客户端环境中可用的 ripgrep；插件不会在后台安
 
 ### Token 用量与上下文百分比
 
-当前实测的 Comate 云端 execute 流不返回 token 用量。旧版本也没有向客户端提供 `usage`，
-DeepSeek Harness 因而将每步用量记为 0，长任务的上下文指示器也可能一直显示 0%。
-从 `0.5.3` 开始，插件提供**明确标注来源的估算值**，用于上下文参考，不是云端实测或计费凭据。
+从 `0.5.13` 起，插件读取 Comate 云端在终止 `ANSWER` 之后发送的 `TOKEN_USAGE` 事件：
+`inputTokens` 是未命中缓存的输入，`cachedInputTokens` 是缓存命中，`outputTokens` 是输出。
+应答结束前会短暂排空该事件（最多约 2 秒，见 `usageDrainMs`）；一次客户端请求内的多次
+execute（初始、合约纠正、格式重生成）累加。上游给出这些值时：
+
+- `prompt_tokens` = `inputTokens + cachedInputTokens`
+- `completion_tokens` = `outputTokens`
+- `prompt_tokens_details.cached_tokens` = `cachedInputTokens`，`cache_write_tokens` 为 0
+- `usage.comate_usage` 中 `source: "upstream"`、`scope: "comate-cloud"`
+
+上游没有报告 `TOKEN_USAGE`（旧版云端、流被中止或提前取消）时，回退到 `0.5.3` 起的本地估算：
+`source: "estimated"`、`method: "unicode-density-v1"`，按完整可见历史、工具定义和适配提示估算。
 
 - 非流式响应包含标准 `usage.prompt_tokens`、`completion_tokens`、`total_tokens`。
 - 流式在成功结束后、`[DONE]` 前发送一次 `choices: []` 的 usage chunk；默认发送，
   显式设置 `stream_options.include_usage: false` 可关闭。失败或取消不会输出成功用量。
-- `usage.comate_usage` 中 `source: "estimated"`、`method: "unicode-density-v1"` 标注估算来源，
-  响应头另有 `X-Comate-Usage-Source: estimated`。网关或客户端可能只保留标准计数，不显示来源标签。
+- 响应头 `X-Comate-Usage-Source` 在非流式应答中为 `upstream` 或 `estimated`；
+  流式应答的头在正文开始前写出，固定为 `reported-in-body`，真实来源见 usage chunk 的 `comate_usage.source`。
+  网关或客户端可能只保留标准计数，不显示来源标签。
 
-输入按**完整可见历史**、工具定义和适配提示估算，包含历史工具调用及返回结果；原生续聊只上传增量时，
-仍计算保留的上下文。输出包含正文、推理及原生工具调用参数，推理同时列在
-`completion_tokens_details.reasoning_tokens` 中，已包含于输出总数，不重复相加。
-不声明未知的缓存命中。估算规则为 ASCII 每 4 字符约 1 token、其他 BMP 字符约 1 token、
-补充平面字符约 2 token；每张历史图片固定预留 1,024 token，不按 base64 长度计价。
+输出包含正文、推理及原生工具调用参数，推理同时列在 `completion_tokens_details.reasoning_tokens` 中，
+已包含于输出总数，不重复相加（仅估算路径；上游只给总输出）。估算规则为 ASCII 每 4 字符约 1 token、
+其他 BMP 字符约 1 token、补充平面字符约 2 token；每张历史图片固定预留 1,024 token，不按 base64 长度计价。
 
-这不是各模型的专用 tokenizer：云端隐藏提示、自动压缩、图片切片及真实缓存均不可见，数值可能偏高或偏低。
+这不是各模型的专用 tokenizer：云端隐藏提示、自动压缩、图片切片不在可见上下文内。
 百分比还依赖客户端配置的模型容量；插件没有按模型名猜测容量。已有日志中的零值不会被回写，
 更新生效后的新请求才会带用量。请在长任务完成后更新插件并开启新请求，避免中途替换插件宿主。
 
@@ -234,7 +242,7 @@ MAGPIE_HOST=/absolute/path/to/host.js MAGPIE_BUN=/absolute/path/to/bun npm test
 ```
 
 `cloud.test.mjs` 和 `cloud-features.test.mjs` 验证新云端传输、原生续聊、图片及长任务，`cloud-host.test.mjs` 使用显式指定的生产 Magpie 宿主和假云端服务。
-`usage.test.mjs` 验证完整历史、工具/图片/推理估算和流式用量；0.5.3 已完成本机独立 Magpie 网关到真实 Comate、再到 Harness CLI 的用量联调。
+`usage.test.mjs` 验证完整历史、工具/图片/推理估算，以及终止 `ANSWER` 之后的 `TOKEN_USAGE`（流式与非流式、纠正累加、排空超时）；0.5.3 已完成本机独立 Magpie 网关到真实 Comate、再到 Harness CLI 的用量联调。
 测试不会自行寻找邻近仓库。没有显式宿主/Bun 时宿主测试跳过。
 `local-transport.fixture.mjs` 仅保留旧本地传输回归，未由生产入口导入，也不进入 npm 包。
 旧 `models.test.mjs`、`protocol-transport.test.mjs` 和 `integration.test.mjs` 对它的测试不能作为新云端传输验收。
@@ -261,6 +269,8 @@ npm 载荷只有 LICENSE、README.md、index.mjs、cloud.mjs、cloud-session.mjs
 云端流适配失败时，错误 message 末尾附 ` [comate_diagnostics={...}]`，只记录有界的每回合事件/字符/字节/调用计数、明确终止状态、标记出现次数、JSON 语法状态和白名单停止原因。不记录正文、推理内容、参数、工具名/ID、标记值或任意上游字段。缺少云端停止原因时标记为 `not_reported`，不据此断言输出预算耗尽。客户端 max_tokens/max_completion_tokens 当前没有映射到 Comate execute 的生成控制字段，诊断显式标注 `client_output_limit_forwarded:false`；不猜测未核实的云端 API 参数。最终格式反馈仍是 query 内标注 system 角色的 JSON 行，不能视为已证明的 SDK 原生 system 消息。真实长任务效果需后续评测确认。
 
 0.5.11 将此前分散在修复分支上的 0.5.4–0.5.10 修改汇总至 main，并保留 main 已有的网页搜索参数兼容修复。网页搜索的参数语义错误接入同一有界合约纠正流程；保留原始原生 ID、参数与真实客户端结果的对应。三次 execute 上限及客户端工具/schema/choice/parallel 校验保持一致。
+
+0.5.13 读取 Comate 云端在终止 `ANSWER` 之后发送的 `TOKEN_USAGE`，把上游真实输入、缓存命中与输出写入标准 usage 和 `prompt_tokens_details.cached_tokens`，并在应答前短暂排空尾部事件；上游未报告时仍回退到带来源标注的本地估算。修复此前缓存命中率恒为 0%、token 数仅由估算得出的问题（issue #3）。
 
 0.5.12 修复 Comate 流式响应交还后调用方取消但尚未消费 body 时会遗留会话锁的问题，并让每次请求仅能释放自己持有的锁，避免旧流迟到 cleanup 解锁正在续轮的请求。云端工具仍只交由客户端审批和执行。
 

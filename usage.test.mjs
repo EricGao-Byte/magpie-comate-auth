@@ -7,7 +7,7 @@ const auth = { type: 'api', key: 'usage-fixture' }
 const answer = detail => ({ content: { type: 'ANSWER', detail } })
 const tools = [{ type: 'function', function: { name: 'echo', parameters: { type: 'object', properties: { text: { type: 'string' } } } } }]
 const messages = [{ role: 'user', content: 'Read the task and answer.' }]
-async function setup(output) {
+async function setup(output, options = {}) {
   const payloads = []
   const hooks = await ComateAuthPlugin({}, { fetchImpl: async (url, init) => {
     if (url.endsWith('/conversation')) return Response.json({ code: 0, data: { id: 1 } })
@@ -16,7 +16,7 @@ async function setup(output) {
     payloads.push(body)
     const items = typeof output === 'function' ? output(body, payloads.length) : output
     return new Response(items.map(x => 'data: ' + JSON.stringify(x) + '\n\n').join(''), { headers: { 'content-type': 'text/event-stream' } })
-  } })
+  }, ...options })
   const loader = await hooks.auth.loader(async () => auth)
   return { payloads, request: chat => loader.fetch('https://fixture/v1/chat/completions', { body: JSON.stringify({ model: 'usage-model', messages, ...chat }), headers: { 'x-magpie-comate-session': 'usage-session' } }) }
 }
@@ -67,7 +67,7 @@ test('stream and JSON responses agree and emit usage before DONE with explicit p
   const jsonResponse = await a.request({})
   const streamResponse = await b.request({ stream: true, stream_options: { include_usage: true } })
   assert.equal(jsonResponse.headers.get('x-comate-usage-source'), 'estimated')
-  assert.equal(streamResponse.headers.get('x-comate-usage-source'), 'estimated')
+  assert.equal(streamResponse.headers.get('x-comate-usage-source'), 'reported-in-body')
   const json = await jsonResponse.json(), text = await streamResponse.text(), all = frames(text)
   const usage = all.filter(x => x.usage)
   assert.equal(usage.length, 1)
@@ -99,4 +99,91 @@ test('failed streams never emit successful usage; explicit include_usage false i
   assert.equal(frames(failed).filter(x => x.usage).length, 0)
   const good = await setup([answer({ delta: 'OK', end: true })])
   assert.equal(frames(await (await good.request({ stream: true, stream_options: { include_usage: false } })).text()).filter(x => x.usage).length, 0)
+})
+
+const tokenUsage = usage => ({ content: { type: 'TOKEN_USAGE', detail: { modelName: 'usage-model', usage } } })
+const upstream = { inputTokens: 52, cachedInputTokens: 13312, outputTokens: 2 }
+const reported = {
+  prompt_tokens: 13364,
+  completion_tokens: 2,
+  total_tokens: 13366,
+  prompt_tokens_details: { cached_tokens: 13312, cache_write_tokens: 0 },
+  comate_usage: { source: 'upstream', scope: 'comate-cloud', cached_tokens: 13312 },
+}
+
+test('upstream token usage is preferred over the estimate and accumulated across executes', () => {
+  const meter = createUsageMeter(messages, tools, 'instructions')
+  meter.upstream(upstream)
+  meter.upstream({ inputTokens: '10', cachedInputTokens: 5, outputTokens: 3 })
+  assert.deepEqual(meter.value(), {
+    prompt_tokens: 13379,
+    completion_tokens: 5,
+    total_tokens: 13384,
+    prompt_tokens_details: { cached_tokens: 13317, cache_write_tokens: 0 },
+    comate_usage: { source: 'upstream', scope: 'comate-cloud', cached_tokens: 13317 },
+  })
+})
+
+test('TOKEN_USAGE after the terminal ANSWER is metered in both modes', async () => {
+  const output = [answer({ delta: 'OK', end: true }), tokenUsage(upstream)]
+  const json = await setup(output), stream = await setup(output)
+  const jsonResponse = await json.request({})
+  const streamResponse = await stream.request({ stream: true, stream_options: { include_usage: true } })
+  assert.equal(jsonResponse.headers.get('x-comate-usage-source'), 'upstream')
+  // A stream's header is written before its body runs, so it points at the body.
+  assert.equal(streamResponse.headers.get('x-comate-usage-source'), 'reported-in-body')
+  const jsonUsage = (await jsonResponse.json()).usage
+  const streamUsage = frames(await streamResponse.text()).find(x => x.usage).usage
+  assert.deepEqual(jsonUsage, reported)
+  assert.deepEqual(streamUsage, reported)
+})
+
+test('TOKEN_USAGE before the terminal ANSWER is metered too', async () => {
+  const x = await setup([tokenUsage(upstream), answer({ delta: 'OK', end: true })])
+  assert.deepEqual((await (await x.request({})).json()).usage, reported)
+})
+
+test('a correction round is not held by a usage drain that timed out', { timeout: 2_000 }, async () => {
+  const encoder = new TextEncoder()
+  let round = 0
+  const hooks = await ComateAuthPlugin({}, { usageDrainMs: 25, fetchImpl: async (url, init) => {
+    if (url.endsWith('/conversation')) return Response.json({ code: 0, data: { id: 1 } })
+    if (url.endsWith('/task')) return Response.json({ code: 0, data: { taskId: 2 } })
+    const body = JSON.parse(init.body)
+    round++
+    if (round === 1) {
+      // A rejected native call needs a correction round, and this body never
+      // closes and never sends TOKEN_USAGE.
+      const items = [{ content: { type: 'FUNCTION_CALL_END', detail: { toolUse: [{ id: 'native-1', name: 'delete_file', input: {} }] } } }, answer({ end: true })]
+      return new Response(new ReadableStream({ start(controller) { controller.enqueue(encoder.encode(items.map(x => 'data: ' + JSON.stringify(x) + '\n\n').join(''))) } }), { headers: { 'content-type': 'text/event-stream' } })
+    }
+    const name = body.tools[0].function.name
+    return new Response('data: ' + JSON.stringify({ content: { type: 'FUNCTION_CALL_END', detail: { toolUse: [{ id: 'native-2', name, input: { text: 'ok' } }] } } }) + '\n\ndata: ' + JSON.stringify(answer({ end: true })) + '\n\n', { headers: { 'content-type': 'text/event-stream' } })
+  } })
+  const loader = await hooks.auth.loader(async () => auth)
+  const response = await loader.fetch('https://fixture', { body: JSON.stringify({ model: 'usage-model', messages, tools, tool_choice: 'required' }) })
+  assert.equal(response.status, 200)
+  assert.equal((await response.json()).choices[0].message.tool_calls[0].function.name, 'echo')
+  assert.equal(round, 2)
+})
+
+test('a stream that sends no TOKEN_USAGE and never closes still completes', async () => {
+  const encoder = new TextEncoder()
+  let cancelled = false
+  const body = new ReadableStream({
+    start(controller) { controller.enqueue(encoder.encode('data: ' + JSON.stringify(answer({ delta: 'OK', end: true })) + '\n\n')) },
+    cancel() { cancelled = true },
+  })
+  const hooks = await ComateAuthPlugin({}, { usageDrainMs: 25, fetchImpl: async url => {
+    if (url.endsWith('/conversation')) return Response.json({ code: 0, data: { id: 1 } })
+    if (url.endsWith('/task')) return Response.json({ code: 0, data: { taskId: 2 } })
+    return new Response(body, { headers: { 'content-type': 'text/event-stream' } })
+  } })
+  const loader = await hooks.auth.loader(async () => auth)
+  const response = await loader.fetch('https://fixture', { body: JSON.stringify({ model: 'usage-model', messages }) })
+  assert.equal(response.status, 200)
+  const usage = (await response.json()).usage
+  assert.equal(usage.comate_usage.source, 'estimated')
+  await new Promise(resolve => setTimeout(resolve, 20))
+  assert.equal(cancelled, true)
 })

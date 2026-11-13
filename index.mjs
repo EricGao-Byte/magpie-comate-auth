@@ -228,8 +228,11 @@ function chunkEncoder(chat, uuid) {
   return { encode, usage, done: "data: [DONE]\n\n" }
 }
 
-function usageHeaders(task) {
-  return task.usage ? { "X-Comate-Usage-Source": "estimated" } : {}
+// A stream's headers are written before its body runs, so it can only point
+// at the usage chunk in that body; a JSON reply is final here.
+function usageHeaders(task, stream = false) {
+  if (!task.usage) return {}
+  return { "X-Comate-Usage-Source": stream ? "reported-in-body" : (task.source?.() ?? task.usage().comate_usage.source) }
 }
 
 async function finished(chat, response, task, toolSpec, uuid, license) {
@@ -358,7 +361,7 @@ function streamed(chat, response, task, toolSpec, uuid, license) {
     },
   }, { highWaterMark: 0 }), {
     status: 200,
-    headers: { "content-type": "text/event-stream", "cache-control": "no-cache", ...usageHeaders(task) },
+    headers: { "content-type": "text/event-stream", "cache-control": "no-cache", ...usageHeaders(task, true) },
   })
 }
 
