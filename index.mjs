@@ -1,6 +1,7 @@
 import { randomUUID as nodeRandomUUID } from "node:crypto"
 import * as discovery from "./discovery.mjs"
 import { cloudHooks } from "./cloud.mjs"
+import { cookieIn, cookieOf, quotaOf, userOf } from "./web.mjs"
 import {
   buildQuery,
   comatePieces,
@@ -419,6 +420,51 @@ function licenseSignIn() {
   }
 }
 
+// The allowance Comate's IDE reports is empty for a personal account; the
+// points it spends are on its website. A signed-in browser's BDUSS cookie
+// reads them there, and the same cookie names the license the chat path
+// spends, so one paste signs the account in and shows what is left.
+function cookieSignIn(options = {}) {
+  const fetchImpl = options.fetchImpl ?? globalThis.fetch
+  const ask = "Paste the BDUSS cookie from comate.baidu.com (it is the cookie, not the license)"
+  return {
+    type: "api",
+    label: "Comate web cookie (paste)",
+    labels: { zh: "Comate 网页 Cookie（粘贴）", "zh-TW": "Comate 網頁 Cookie（貼上）", ja: "Comate Web Cookie（貼り付け）" },
+    placeholder: "BDUSS=…",
+    prompts: [
+      {
+        type: "text",
+        key: "cookie",
+        message: "BDUSS cookie from comate.baidu.com (DevTools → Application → Cookies)",
+        messages: {
+          zh: "comate.baidu.com 的 BDUSS Cookie（开发者工具 → 应用 → Cookie）",
+          "zh-TW": "comate.baidu.com 的 BDUSS Cookie（開發者工具 → 應用程式 → Cookie）",
+          ja: "comate.baidu.com の BDUSS Cookie（開発ツール → アプリケーション → Cookie）",
+        },
+        validate: (value) => (cookieOf(value) ? undefined : ask),
+      },
+    ],
+    async authorize(inputs, { signal } = {}) {
+      const cookie = cookieOf(inputs?.cookie)
+      if (!cookie) return { type: "failed", error: ask }
+      let who
+      try {
+        who = await userOf(cookie, { fetchImpl, signal })
+      } catch (error) {
+        return { type: "failed", error: string(error?.message) || "Comate's website could not be read." }
+      }
+      // No accountId: the same license signed in by the license alone is the
+      // same account, and host.js settle merges this into it by its key.
+      return {
+        type: "success",
+        key: who.license,
+        metadata: { cookie, source: "comate-paste", ...(who.username ? { username: who.username } : {}) },
+      }
+    },
+  }
+}
+
 function makePlugin(options = {}) {
   const discoveryOptions = { ...(options.discoveryOptions ?? options), port: 8741 }
   return async () => ({
@@ -428,6 +474,7 @@ function makePlugin(options = {}) {
       methods: [
         { type: "oauth", label: "Comate account (this computer)", authorize: async () => desktopSignIn(discoveryOptions) },
         licenseSignIn(),
+        cookieSignIn(options),
       ],
     },
   })
@@ -463,4 +510,9 @@ export const _internal = {
   finished,
   makePlugin,
   createPlugin: makePlugin,
+  cookieSignIn,
+  cookieOf,
+  cookieIn,
+  userOf,
+  quotaOf,
 }

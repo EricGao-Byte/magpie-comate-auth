@@ -7,6 +7,7 @@ import { normalizeMessages, imagesFrom } from "./images.mjs"
 import { clientToolCall, clientToolContract, UnofferedToolError, ToolContractError } from "./tool-adapter.mjs"
 import { SESSION_HEADER, sessionKey, historyHash, catalogHash, continuation, nativeResults } from "./cloud-session.mjs"
 import { createUsageMeter } from "./usage.mjs"
+import { cookieIn, quotaOf } from "./web.mjs"
 
 const ORIGIN = "https://comate.baidu.com"
 const API = "/api/aidevops/autocomate/rest/autowork/v2"
@@ -281,6 +282,19 @@ export function cloudHooks(hooks, options = {}, shared) {
         if (!handedOff) releaseBusy()
       }
     } }
+  }
+  // The IDE's own quota is empty for a personal account, so this reads the
+  // points on Comate's website with the cookie the account was signed in
+  // with (web.mjs). A read that fails is no sign-in's: the license, which
+  // every request spends, is untouched, so nothing is rested here.
+  hooks.auth.usage = async (getAuth, provider, call = {}) => {
+    const auth = await getAuth()
+    if (!discovery.isComate(auth)) return {}
+    const cookie = cookieIn(auth)
+    if (!cookie) return { windows: [], error: "Comate reports its allowance only on comate.baidu.com: add its web cookie method to see it here." }
+    const quota = await quotaOf(cookie, { fetchImpl, signal: call?.signal })
+    const user = str(auth?.metadata?.username)
+    return user ? { ...quota, user } : quota
   }
   return hooks
 }

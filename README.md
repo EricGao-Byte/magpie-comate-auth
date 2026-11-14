@@ -1,6 +1,6 @@
 # Magpie Comate Auth — independent plugin
 
-本地主线开发版本 `0.5.13`。通过 HTTPS 直接请求 Comate 云端，复用这台电脑的 Comate 登录态。
+本地主线开发版本 `0.5.14`。通过 HTTPS 直接请求 Comate 云端，复用这台电脑的 Comate 登录态。
 不调用 Comate 本地服务的会话、工具执行或取消接口；云端不可用时直接报错。
 本插件独立维护，通过 Magpie 的非官方插件发现机制分发，未获官方市场审核批准。
 仓库是公开的非 fork 项目，并带有 `magpie-plugin` GitHub topic。无需 npm 发布。
@@ -26,7 +26,7 @@ magpie plugin login comate 1
 ### 方式二：下载构建产物，用本地文件夹安装
 
 从 [最新 Release](https://github.com/PengJunchen/magpie-comate-auth/releases/latest) 下载
-`magpie-comate-auth-0.5.13.zip`（附件里的安装包，不是 GitHub 自动生成的 Source code.zip），
+`magpie-comate-auth-0.5.14.zip`（附件里的安装包，不是 GitHub 自动生成的 Source code.zip），
 解压到准备长期保留的目录，例如 `~/MagpiePlugins/`：
 
 ```text
@@ -73,8 +73,8 @@ dist/
 │   ├── package.json
 │   ├── index.mjs
 │   └── …
-├── magpie-comate-auth-0.5.13.zip          ← 可直接解压的运行文件
-├── pengjunchen-magpie-comate-auth-0.5.13.tgz
+├── magpie-comate-auth-0.5.14.zip          ← 可直接解压的运行文件
+├── pengjunchen-magpie-comate-auth-0.5.14.tgz
 ├── BUILD-INFO.json
 └── SHA256SUMS
 ```
@@ -100,7 +100,8 @@ magpie plugin list
 magpie plugin use github:PengJunchen/magpie-comate-auth comate
 ```
 
-也支持手工输入 license。宿主会保存凭据；对话、系统提示、工具定义、图片和客户端工具结果会发往
+也支持手工输入 license。若还想看到额度积分，用 **Comate web cookie (paste)** 粘贴一次 BDUSS（见下一节）。
+宿主会保存凭据；对话、系统提示、工具定义、图片和客户端工具结果会发往
 `https://comate.baidu.com`。插件只读 Comate 设置，不修改该文件；macOS 默认位置为
 `~/Library/Application Support/Comate/User/settings.json`，可用绝对路径 `COMATE_SETTINGS_PATH` 覆盖。
 Windows/Linux 的路径有单元测试，但尚未完成本版本原机验收。
@@ -234,6 +235,34 @@ execute（初始、合约纠正、格式重生成）累加。上游给出这些�
 百分比还依赖客户端配置的模型容量；插件没有按模型名猜测容量。已有日志中的零值不会被回写，
 更新生效后的新请求才会带用量。请在长任务完成后更新插件并开启新请求，避免中途替换插件宿主。
 
+### 额度（积分）与网页 Cookie
+
+Comate 桌面端只对厂内账号报告额度：个人账号的 `daily_cost` 接口返回 `data: null`，
+按 license 读不到任何额度数字。积分（套餐、加量包、赠送）只存在 `comate.baidu.com`
+的网页接口里，而且只认浏览器的百度登录态（`BDUSS` Cookie）。
+
+从 `0.5.14` 起，插件提供第三种登录方式 **Comate web cookie (paste)**：
+
+1. 浏览器登录 <https://comate.baidu.com/zh/user>。
+2. 开发者工具 → Application（应用）→ Cookies → `comate.baidu.com`，复制 `BDUSS` 的值；
+   也可以从 Network 面板里请求头的 `Cookie` 中复制 `BDUSS=…`。整段 Cookie 或单独的值都能粘贴。
+3. `magpie plugin login comate "Comate web cookie (paste)"`，或在界面的添加/重新登录里选这一项。
+
+插件用这个 Cookie 调 `/api/user` 取回该账号的 license，对话仍用 license 走云端；
+同一个 license 会合并到已经用 license 登录的账号，不会多出一个账号。额度卡片随后显示：
+
+- **Seat**：套餐积分，带下次发放时间（每月）；
+- **Add-on**：加量包积分，带最早的到期时间，以及届时失效的数量；
+- **Gift**：赠送积分（每日签到发放的、长期有效的各自到期时间）。
+
+没有 Cookie 时，卡片会写明额度只在网页上并给出上面的做法，而不是只显示“暂无额度数据”。
+Cookie 被百度注销或过期时同样提示重新粘贴；这只影响额度显示，不会停用账号，也不影响对话。
+重新用 license 登录一次会清掉旧 Cookie。
+
+> 安全提示：`BDUSS` 是整个百度账号的登录态（百度网盘等其他服务同样可用），权限比 Comate
+> license 大。它和 license 一样以明文保存在 Magpie 的凭据文件里，插件只把它发给
+> `comate.baidu.com`；不再需要时，在百度退出登录即可让它失效。
+
 ## 验证
 
 ```sh
@@ -269,6 +298,8 @@ npm 载荷只有 LICENSE、README.md、index.mjs、cloud.mjs、cloud-session.mjs
 云端流适配失败时，错误 message 末尾附 ` [comate_diagnostics={...}]`，只记录有界的每回合事件/字符/字节/调用计数、明确终止状态、标记出现次数、JSON 语法状态和白名单停止原因。不记录正文、推理内容、参数、工具名/ID、标记值或任意上游字段。缺少云端停止原因时标记为 `not_reported`，不据此断言输出预算耗尽。客户端 max_tokens/max_completion_tokens 当前没有映射到 Comate execute 的生成控制字段，诊断显式标注 `client_output_limit_forwarded:false`；不猜测未核实的云端 API 参数。最终格式反馈仍是 query 内标注 system 角色的 JSON 行，不能视为已证明的 SDK 原生 system 消息。真实长任务效果需后续评测确认。
 
 0.5.11 将此前分散在修复分支上的 0.5.4–0.5.10 修改汇总至 main，并保留 main 已有的网页搜索参数兼容修复。网页搜索的参数语义错误接入同一有界合约纠正流程；保留原始原生 ID、参数与真实客户端结果的对应。三次 execute 上限及客户端工具/schema/choice/parallel 校验保持一致。
+
+0.5.14 增加网页 Cookie 登录：用百度登录态读取 Comate 网页端的积分额度（套餐/加量包/赠送，含发放与到期时间），交给 Magpie 的 `auth.usage` 显示；没有 Cookie 或 Cookie 失效时说明原因，不影响 license 对话。授权时用 Cookie 换回 license，同一 license 合并到原账号。
 
 0.5.13 读取 Comate 云端在终止 `ANSWER` 之后发送的 `TOKEN_USAGE`，把上游真实输入、缓存命中与输出写入标准 usage 和 `prompt_tokens_details.cached_tokens`，并在应答前短暂排空尾部事件；上游未报告时仍回退到带来源标注的本地估算。修复此前缓存命中率恒为 0%、token 数仅由估算得出的问题（issue #3）。
 
